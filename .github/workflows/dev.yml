@@ -1,0 +1,117 @@
+name: Deploy Demo Image to EC2 (no Compose)
+on:
+  push:
+    branches: [demo]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      BE_DEMO_IMAGE: theflex-demo-be
+      DOCKER_RUN_ARGS: ${{ secrets.DOCKER_RUN_ARGS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute tag and tar name
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          SHA="$(git rev-parse --short HEAD)"
+          echo "IMAGE_TAG=${BRANCH}-${SHA}" >> $GITHUB_ENV
+          echo "DEMO_TAR=${BE_DEMO_IMAGE}-${SHA}.tar.gz" >> $GITHUB_ENV
+
+      # -------- BUILD IN CI --------
+      - name: Build demo image
+        run: |
+          docker build \
+            --file Dockerfile \
+            --tag "${BE_DEMO_IMAGE}:${IMAGE_TAG}" \
+            .
+
+      - name: Save image as tar.gz
+        run: |
+          docker save "${BE_DEMO_IMAGE}:${IMAGE_TAG}" | gzip > "${DEMO_TAR}"
+          ls -lh "${DEMO_TAR}"
+
+      # -------- SSH PREP --------
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -H "${{ secrets.EC2_DEMO_HOST }}" >> ~/.ssh/known_hosts
+          echo "${{ secrets.EC2_DEMO_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      # -------- COPY ONLY IMAGE --------
+      - name: Create target dirs on EC2
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_DEMO_HOST }}
+        run: |
+          ssh -i private_key.pem "$EC2_USER@$EC2_HOST" 'mkdir -p ~/demo/backend'
+
+      - name: Upload image to EC2
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_DEMO_HOST }}
+        run: |
+          scp -i private_key.pem "${DEMO_TAR}" "$EC2_USER@$EC2_HOST:~/demo/backend/"
+
+      # -------- LOAD + RUN (on external network) --------
+      - name: Load image and run container on EC2
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_DEMO_HOST }}
+          BE_DEMO_IMAGE: ${{ env.BE_DEMO_IMAGE }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          DEMO_TAR: ${{ env.DEMO_TAR }}
+          DOCKER_RUN_ARGS: ${{ env.DOCKER_RUN_ARGS }}
+          NETWORK_NAME: theflex-network 
+        run: |
+          ssh -i private_key.pem "$EC2_USER@$EC2_HOST" bash -se <<EOF
+            set -euo pipefail
+
+            # Injected from CI env:
+            BE_DEMO_IMAGE="${BE_DEMO_IMAGE}"
+            IMAGE_TAG="${IMAGE_TAG}"
+            DEMO_TAR="${DEMO_TAR}"
+            DOCKER_RUN_ARGS="${DOCKER_RUN_ARGS}"
+
+            APP_ENV="\$HOME/demo/backend/.env"
+            TARBALL="\$HOME/demo/backend/\${DEMO_TAR}"
+            NETWORK_NAME="${NETWORK_NAME:-theflex-network}"
+
+            if [[ ! -f "\$APP_ENV" ]]; then
+              echo "ERROR: \${APP_ENV} not found on server." >&2
+              exit 1
+            fi
+
+            echo ">>> Ensure external network exists: ${NETWORK_NAME}"
+            if ! sudo docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+              echo ">>> Creating network: ${NETWORK_NAME}"
+              sudo docker network create "${NETWORK_NAME}"
+            fi
+
+            echo ">>> Loading image: \${TARBALL}"
+            sudo gunzip -f "\$TARBALL"
+            sudo docker load -i "\${TARBALL%.gz}"
+            sudo rm -f "\${TARBALL%.gz}"
+
+            echo ">>> Restarting container: theflex-demo-be"
+            sudo docker rm -f theflex-demo-be || true
+            sudo docker run -d \
+              --name theflex-demo-be \
+              --restart unless-stopped \
+              --env-file "\$APP_ENV" \
+              --network "\${NETWORK_NAME}" \
+              -p 5000:5000 \
+              \${DOCKER_RUN_ARGS:-} \
+              "\${BE_DEMO_IMAGE}:\${IMAGE_TAG}"
+
+            echo "Deployment complete."
+          EOF
+
+      - name: Cleanup CI artifacts
+        if: always()
+        run: |
+          rm -f private_key.pem "${DEMO_TAR}"
