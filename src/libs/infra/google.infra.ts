@@ -52,4 +52,30 @@ export class GoogleService {
       );
     }
   }
+
+  async findPlaceIdByText(text: string) {
+    try {
+      const apiKey = Config.GOOGLE_PLACES_API_KEY;
+      const baseURL = Config.GOOGLE_PLACES_BASE_URL;
+
+      const apiInstance = axios.create({
+        baseURL: baseURL,
+        headers: {
+          'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+        },
+      });
+      const fieldMask = 'places.id,places.displayName';
+      const response = await apiInstance.get(
+        `/places:${text}`,
+        { headers: { 'X-Goog-FieldMask': fieldMask } }
+        );
+      const data = response.data;
+      return data;
+    } catch (error) {
+      throw new Error(
+        `Fetching reviews failed: ${error.message}`,
+      );
+    }
+  }
 }
